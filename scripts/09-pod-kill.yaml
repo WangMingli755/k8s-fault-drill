@@ -1,0 +1,19 @@
+# Pod kill：随机杀掉一个 lab-web Pod，验证 Deployment 自愈与短暂不可用。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: smoke-pod-kill
+  namespace: training-lab
+  labels:
+    training.example.com/scenario: pod-kill
+  annotations:
+    training.example.com/expires-at: "__EXPIRES_AT__"
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - training-lab
+    labelSelectors:
+      app: lab-web
+  gracePeriod: 0

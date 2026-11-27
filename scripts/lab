@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# Kubernetes 故障演练一键入口（默认只操作 training-lab）
+set -uo pipefail
+
+LAB_HOME="${LAB_HOME:-$HOME/k8s-fault-lab}"
+KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
+KUBECONFIG_PATH="${ADMIN_KUBECONFIG:-$HOME/.kube/config}"
+CTX="${ADMIN_CONTEXT:-$($KUBECTL_BIN config current-context)}"
+NS="${LAB_NS:-training-lab}"
+KC=("--kubeconfig" "$KUBECONFIG_PATH" "--context" "$CTX" "--request-timeout=30s")
+
+k() { "$KUBECTL_BIN" "${KC[@]}" "$@"; }
+
+need_ns() {
+  if ! k get ns "$NS" >/dev/null 2>&1; then
+    echo "命名空间 $NS 不存在，请先执行: $0 baseline" >&2
+    exit 1
+  fi
+}
+
+render_and_apply() {
+  local template="$1" output="$2" expires_minutes="$3" duration="${4:-}" kind="${5:-}"
+  local args=(--template "$LAB_HOME/$template" --output "$LAB_HOME/runs/$output" --expires-minutes "$expires_minutes")
+  [ -n "$duration" ] && args+=(--duration "$duration")
+  python3 "$LAB_HOME/prepare-chaos.py" "${args[@]}" >/dev/null
+  sed -i "s|training-lab|$NS|g" "$LAB_HOME/runs/$output"
+  k apply --dry-run=server -f "$LAB_HOME/runs/$output" >/dev/null
+  k apply -f "$LAB_HOME/runs/$output"
+  echo "---"
+  [ -n "$kind" ] && { k get "$kind" -n "$NS" 2>/dev/null || true; }
+}
+
+scenario_net_delay() {
+  local dur="${1:-120}"
+  render_and_apply 06-network-delay.yaml network-delay.yaml "$(( dur / 60 + 2 ))" "${dur}s" networkchaos
+  echo "已注入 client->web 200ms 网络延迟，duration=${dur}s。观察:"
+  echo "  $0 logs"
+}
+
+scenario_cpu_stress() {
+  local dur="${1:-60}"
+  render_and_apply 07-cpu-stress.yaml cpu-stress.yaml "$(( dur / 60 + 1 ))" "${dur}s" stresschaos
+  echo "已注入 lab-web CPU 压力，duration=${dur}s。观察: $KUBECTL_BIN top pods -n $NS"
+}
+
+scenario_pod_kill() {
+  render_and_apply 09-pod-kill.yaml pod-kill.yaml 2 "" podchaos
+  echo "已触发 pod-kill（一次性），Deployment 会自愈。"
+}
+
+scenario_pod_failure() {
+  local dur="${1:-60}"
+  render_and_apply 10-pod-failure.yaml pod-failure.yaml "$(( dur / 60 + 2 ))" "${dur}s" podchaos
+  echo "已注入 lab-web pod-failure，duration=${dur}s。"
+}
+
+scenario_dns_error() {
+  local dur="${1:-60}"
+  render_and_apply 11-dns-error.yaml dns-error.yaml "$(( dur / 60 + 2 ))" "${dur}s" dnschaos
+  echo "已注入 lab-client DNS 解析错误，duration=${dur}s。"
+}
+
+scenario_service_selector() {
+  need_ns
+  local before="$LAB_HOME/runs/lab-web-selector-before.json"
+  k get service lab-web -n "$NS" -o jsonpath='{.spec.selector}' > "$before"
+  echo "原始 selector 已保存: $before"
+  k patch service lab-web -n "$NS" --type=json \
+    -p='[{"op":"replace","path":"/spec/selector/app","value":"lab-web-missing"}]'
+  echo "--- EndpointSlice（应为空）---"
+  k get endpointslice -n "$NS" -l kubernetes.io/service-name=lab-web 2>/dev/null || true
+  echo "已注入 Service selector 错误。恢复: $0 recover service-selector"
+}
+
+scenario_finalizer() {
+  need_ns
+  sed "s|training-lab|$NS|g; s|registry.k8s.io/pause:3.9|${LAB_PAUSE_IMAGE:-registry.k8s.io/pause:3.9}|g" "$LAB_HOME/08-finalizer-pod.yaml" | k apply -f -
+  k wait --for=condition=Ready pod/smoke-finalizer -n "$NS" --timeout=180s || true
+  k delete pod smoke-finalizer -n "$NS" --wait=false
+  echo "--- 删除中的 Pod（应保留 finalizer）---"
+  k get pod smoke-finalizer -n "$NS" -o json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("Pod 已不存在"); raise SystemExit
+print(json.dumps({"name": d["metadata"]["name"],
+                  "deletionTimestamp": d["metadata"].get("deletionTimestamp"),
+                  "finalizers": d["metadata"].get("finalizers"),
+                  "phase": d["status"].get("phase")}, ensure_ascii=False, indent=2))
+' || true
+  echo "恢复: $0 recover finalizer"
+}
+
+recover_one() {
+  local s="$1"
+  case "$s" in
+    net-delay)     k delete networkchaos smoke-network-delay -n "$NS" --ignore-not-found ;;
+    cpu-stress)    k delete stresschaos smoke-cpu-stress -n "$NS" --ignore-not-found ;;
+    pod-kill)      k delete podchaos smoke-pod-kill -n "$NS" --ignore-not-found ;;
+    pod-failure)   k delete podchaos smoke-pod-failure -n "$NS" --ignore-not-found ;;
+    dns-error)     k delete dnschaos smoke-dns-error -n "$NS" --ignore-not-found ;;
+    service-selector)
+      local before="$LAB_HOME/runs/lab-web-selector-before.json"
+      local selector='{"app":"lab-web"}'
+      [ -s "$before" ] && selector="$(cat "$before")"
+      k patch service lab-web -n "$NS" --type=merge -p "{\"spec\":{\"selector\":$selector}}"
+      ;;
+    finalizer)
+      if k get pod smoke-finalizer -n "$NS" >/dev/null 2>&1; then
+        k patch pod smoke-finalizer -n "$NS" --type=json \
+          -p='[{"op":"test","path":"/metadata/finalizers","value":["training.example.com/manual-cleanup"]},{"op":"remove","path":"/metadata/finalizers/0"}]'
+        k wait --for=delete pod/smoke-finalizer -n "$NS" --timeout=60s || true
+      else
+        echo "smoke-finalizer 已不存在"
+      fi
+      ;;
+    *) echo "未知场景: $s" >&2; return 1 ;;
+  esac
+  echo "已恢复: $s"
+}
+
+cmd_status() {
+  need_ns
+  echo "=== context: $CTX ==="
+  k get pods -n "$NS" -o wide
+  echo "=== service/endpoints ==="
+  k get service,endpointslice -n "$NS" 2>/dev/null | head -20
+  echo "=== chaos CR ==="
+  k get networkchaos,stresschaos,podchaos,dnschaos,httpchaos,iochaos,timechaos -n "$NS" 2>/dev/null || true
+  echo "=== lab-client 最近日志 ==="
+  k logs deployment/lab-client -n "$NS" --tail=8 2>/dev/null || true
+}
+
+cmd_baseline() {
+  sed "s|training-lab|$NS|g" "$LAB_HOME/01-namespaces.yaml" | k apply -f -
+  sed "s|training-lab|$NS|g; s|python:3.10-slim|${LAB_IMAGE:-python:3.10-slim}|g" "$LAB_HOME/04-baseline.yaml" | k apply -f -
+  k rollout status deployment/lab-web -n "$NS" --timeout=300s
+  k rollout status deployment/lab-client -n "$NS" --timeout=300s
+  echo "=== 基线日志 ==="
+  k logs deployment/lab-client -n "$NS" --tail=8
+}
+
+cmd_list() {
+  k get networkchaos,stresschaos,podchaos,dnschaos,httpchaos,iochaos,timechaos -n "$NS" 2>/dev/null || true
+}
+
+cmd_logs() {
+  k logs deployment/lab-client -n "$NS" --tail=30 --follow
+}
+
+usage() {
+  cat <<EOF
+用法: $0 <command> [args]
+
+  status                     查看基线、Chaos CR、client 最近日志
+  baseline                   部署/修复 training-lab 基线业务
+  list                       列出当前 Chaos 实验
+  logs                       跟随 lab-client 日志（Ctrl+C 只停止日志）
+
+  inject net-delay [秒]      client->web 200ms 网络延迟（默认 120s）
+  inject cpu-stress [秒]     lab-web CPU 压力（默认 60s）
+  inject pod-kill            杀掉一个 lab-web Pod（一次性）
+  inject pod-failure [秒]    lab-web 持续不可用（默认 60s）
+  inject dns-error [秒]      lab-client DNS 解析失败（默认 60s）
+  inject service-selector    Service selector 错误（配置类，无自动到期）
+  inject finalizer           finalizer 卡删除（配置类，需手动恢复）
+
+  recover <场景|all>         恢复指定场景或全部
+  guard [--execute]          预览/执行到期 Chaos CR 回收
+  help                       本帮助
+
+安全边界：只操作 $NS；Chaos Mesh 已开启命名空间注解过滤。
+EOF
+}
+
+[ -x "$KUBECTL_BIN" ] || KUBECTL_BIN="kubectl"
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+  status)   cmd_status ;;
+  baseline) cmd_baseline ;;
+  list)     cmd_list ;;
+  logs)     cmd_logs ;;
+  inject)
+    s="${1:-}"; shift || true
+    need_ns
+    case "$s" in
+      net-delay)        scenario_net_delay "$@" ;;
+      cpu-stress)       scenario_cpu_stress "$@" ;;
+      pod-kill)         scenario_pod_kill ;;
+      pod-failure)      scenario_pod_failure "$@" ;;
+      dns-error)        scenario_dns_error "$@" ;;
+      service-selector) scenario_service_selector ;;
+      finalizer)        scenario_finalizer ;;
+      *) echo "未知注入场景: ${s:-<空>}" >&2; usage; exit 1 ;;
+    esac
+    ;;
+  recover)
+    s="${1:-all}"
+    if [ "$s" = "all" ]; then
+      for x in net-delay cpu-stress pod-kill pod-failure dns-error service-selector finalizer; do
+        recover_one "$x" || true
+      done
+    else
+      recover_one "$s"
+    fi
+    ;;
+  guard)
+    python3 "$LAB_HOME/chaos-guardian.py" "$@"
+    ;;
+  help|-h|--help) usage ;;
+  *) echo "未知命令: $cmd" >&2; usage; exit 1 ;;
+esac

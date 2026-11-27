@@ -1,0 +1,120 @@
+# 正常业务基线：lab-web（HTTP 服务）+ lab-client（周期请求并打印耗时）。
+# 默认使用公开 python:3.10-slim；如集群有私有镜像仓库，设置 LAB_IMAGE 后重新渲染。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lab-web-content
+  namespace: training-lab
+data:
+  index.html: |
+    ok
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab-web
+  namespace: training-lab
+  labels:
+    app: lab-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lab-web
+  template:
+    metadata:
+      labels:
+        app: lab-web
+    spec:
+      containers:
+        - name: web
+          image: python:3.10-slim
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-m", "http.server", "8080", "--directory", "/srv"]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 1m
+              memory: 16Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: content
+              mountPath: /srv
+              readOnly: true
+      volumes:
+        - name: content
+          configMap:
+            name: lab-web-content
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab-web
+  namespace: training-lab
+  labels:
+    app: lab-web
+spec:
+  selector:
+    app: lab-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab-client
+  namespace: training-lab
+  labels:
+    app: lab-client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lab-client
+  template:
+    metadata:
+      labels:
+        app: lab-client
+    spec:
+      containers:
+        - name: client
+          image: python:3.10-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -u
+            - -c
+            - |
+              import time, urllib.request
+              url = "http://lab-web.training-lab.svc.cluster.local/"
+              while True:
+                  t0 = time.time()
+                  try:
+                      with urllib.request.urlopen(url, timeout=3) as r:
+                          body = r.read(32).decode("utf-8", "replace").strip()
+                          status = r.status
+                  except Exception as e:
+                      body = type(e).__name__
+                      status = "ERR"
+                  ms = int((time.time() - t0) * 1000)
+                  print(f"http={status} elapsed_ms={ms} body={body}", flush=True)
+                  time.sleep(2)
+          resources:
+            requests:
+              cpu: 1m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

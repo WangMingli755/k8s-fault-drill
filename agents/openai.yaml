@@ -1,0 +1,4 @@
+interface:
+  display_name: "K8s 故障演练"
+  short_description: "在任意 Kubernetes 集群分层注入、验证、恢复故障并生成排查手册"
+  default_prompt: "使用 k8s-fault-drill 在目标 K8s 集群按安全边界注入故障，验证现象，恢复并给出排查路径。"

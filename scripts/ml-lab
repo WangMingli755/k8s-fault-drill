@@ -1,0 +1,642 @@
+#!/usr/bin/env bash
+# 机器学习故障场景：训练 OOM/崩溃/卡住/checkpoint/磁盘/下载，推理缺失/就绪/OOM/延迟/版本。
+# 只操作 training-lab；使用公开 python 镜像，CPU 模拟，不需要 GPU。
+set -uo pipefail
+
+LAB_HOME="$(cd "$(dirname "$0")" && pwd)"
+NS="training-lab"
+IMG="${LAB_IMAGE:-python:3.10-slim}"
+SRC="$LAB_HOME/ml-src"
+KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
+KC=()
+[ -n "${ADMIN_KUBECONFIG:-}" ] && KC+=(--kubeconfig "$ADMIN_KUBECONFIG")
+[ -n "${ADMIN_CONTEXT:-}" ] && KC+=(--context "$ADMIN_CONTEXT")
+k() { "$KUBECTL_BIN" "${KC[@]}" "$@"; }
+
+ensure_code() {
+  if [ ! -f "$SRC/train.py" ] || [ ! -f "$SRC/serve.py" ]; then
+    echo "缺少 $SRC/train.py 或 serve.py" >&2
+    return 1
+  fi
+  k create configmap ml-code -n "$NS" \
+    --from-file=train.py="$SRC/train.py" \
+    --from-file=serve.py="$SRC/serve.py" \
+    --dry-run=client -o yaml | k apply -f - >/dev/null
+  k create configmap ml-model-good -n "$NS" \
+    --from-literal='model.json={"format_version": 2, "name": "demo-linear", "weights": [0.1, 0.2, 0.3]}' \
+    --dry-run=client -o yaml | k apply -f - >/dev/null
+  k create configmap ml-model-v1 -n "$NS" \
+    --from-literal='model.json={"format_version": 1, "name": "demo-linear", "weights": [0.1, 0.2, 0.3]}' \
+    --dry-run=client -o yaml | k apply -f - >/dev/null
+}
+
+pod_of() {
+  k get pod -n "$NS" -l "training.example.com/scenario=$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+}
+
+show_scenario() {
+  local s="$1"
+  k get pod -n "$NS" -l "training.example.com/scenario=$s" -o wide 2>/dev/null || true
+  k get job -n "$NS" -l "training.example.com/scenario=$s" 2>/dev/null || true
+  k get deploy,svc -n "$NS" -l "training.example.com/scenario=$s" 2>/dev/null || true
+}
+
+apply_train_job() {
+  local name="$1" mode="$2" data_path="$3" mem_limit="$4" backoff="${5:-0}"
+  k apply -f - >/dev/null <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $name
+  namespace: $NS
+  labels: {training.example.com/scenario: $name}
+spec:
+  backoffLimit: $backoff
+  template:
+    metadata:
+      labels: {app: $name, training.example.com/scenario: $name}
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: seed-data
+          image: $IMG
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "printf '{\"samples\": [[1,2],[3,4]]}' > /data/train.json"]
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+      containers:
+        - name: trainer
+          image: $IMG
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/opt/ml/train.py"]
+          env:
+            - {name: TRAIN_MODE, value: "$mode"}
+            - {name: DATA_PATH, value: "$data_path"}
+          volumeMounts:
+            - {name: code, mountPath: /opt/ml}
+            - {name: data, mountPath: /data}
+            - {name: ckpt, mountPath: /ckpt}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: $mem_limit}
+      volumes:
+        - name: code
+          configMap: {name: ml-code, defaultMode: 0555}
+        - name: data
+          emptyDir: {}
+        - name: ckpt
+          emptyDir: {}
+EOF
+}
+
+apply_infer() {
+  local name="$1" model_cm="$2" env_lines="$3" mem_limit="$4"
+  local volumes="" mounts=""
+  if [ -n "$model_cm" ]; then
+    volumes="        - name: model
+          configMap: {name: $model_cm}"
+    mounts="            - {name: model, mountPath: /models}"
+  fi
+  k apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $name
+  namespace: $NS
+  labels: {training.example.com/scenario: $name}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: $name}
+  template:
+    metadata:
+      labels: {app: $name, training.example.com/scenario: $name}
+    spec:
+      containers:
+        - name: server
+          image: $IMG
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/opt/ml/serve.py"]
+          env:
+$env_lines
+          ports:
+            - {containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: $mem_limit}
+          volumeMounts:
+            - {name: code, mountPath: /opt/ml}
+$mounts
+      volumes:
+        - name: code
+          configMap: {name: ml-code, defaultMode: 0555}
+$volumes
+EOF
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: $name
+  namespace: $NS
+  labels: {training.example.com/scenario: $name}
+spec:
+  selector: {app: $name}
+  ports:
+    - {port: 80, targetPort: 8080}
+EOF
+}
+
+scenario_train_oom() {
+  ensure_code || return 1
+  apply_train_job ml-train-oom oom /data/train.json 128Mi
+  echo "已注入: 训练任务内存持续增长，容器 limit=128Mi，预期 OOMKilled、Job Failed。"
+  sleep 12
+  show_scenario ml-train-oom
+  echo "OOM 证据:"
+  k get pod -n "$NS" -l training.example.com/scenario=ml-train-oom \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"  reason="}{.status.containerStatuses[*].state.terminated.reason}{"  exit="}{.status.containerStatuses[*].state.terminated.exitCode}{"\n"}{end}' 2>/dev/null || true
+  k describe pod -n "$NS" -l training.example.com/scenario=ml-train-oom 2>/dev/null \
+    | grep -A5 'Reason:       OOMKilled' | head -8 || true
+  cat <<'EOF'
+排查路径:
+  kubectl get pod -l training.example.com/scenario=ml-train-oom -n training-lab
+  kubectl describe pod -l training.example.com/scenario=ml-train-oom -n training-lab | grep -A8 'Last State'
+  kubectl logs -l training.example.com/scenario=ml-train-oom -n training-lab --tail=20
+  节点上: dmesg -T | grep -iE 'oom|killed process' | tail
+          grep -iE 'oom|killed process' /var/log/messages | tail
+  区分: 容器 cgroup OOM（reason=OOMKilled）vs 节点 OOM（node_lab logs 可见）
+EOF
+}
+
+scenario_train_crash() {
+  ensure_code || return 1
+  apply_train_job ml-train-crash crash /data/train.csv 128Mi
+  echo "已注入: 训练代码读取不存在的 /data/train.csv，预期异常退出、Job Failed。"
+  sleep 10
+  show_scenario ml-train-crash
+  echo "容器日志:"
+  k logs -n "$NS" -l training.example.com/scenario=ml-train-crash --tail=20 2>/dev/null || true
+  cat <<'EOF'
+排查路径:
+  kubectl logs -l training.example.com/scenario=ml-train-crash -n training-lab --tail=30
+  kubectl describe pod -l training.example.com/scenario=ml-train-crash -n training-lab | tail -20
+  kubectl get job ml-train-crash -n training-lab -o jsonpath='{.status.conditions}'
+  根因: 数据集路径/挂载错误、权限不足、代码异常；看 traceback 最后一行和退出码。
+EOF
+}
+
+scenario_train_hang() {
+  ensure_code || return 1
+  apply_train_job ml-train-hang hang /data/train.json 128Mi
+  echo "已注入: 训练进程打印 step=10 后卡住（等待 dataloader），Pod 一直 Running。"
+  sleep 8
+  show_scenario ml-train-hang
+  local pod; pod="$(pod_of ml-train-hang)"
+  if [ -n "$pod" ]; then
+    echo "进程状态（STAT=T 表示被暂停，D 表示不可中断 IO，CPU 接近 0 说明没在算）:"
+    k exec -n "$NS" "$pod" -- sh -c \
+      'ps -o pid,stat,pcpu,etime,cmd -C python3 2>/dev/null || ps aux | grep train.py | grep -v grep' 2>&1 || true
+  fi
+  cat <<'EOF'
+排查路径:
+  kubectl logs -l training.example.com/scenario=ml-train-hang -n training-lab --timestamps --tail=20
+  kubectl top pod -l training.example.com/scenario=ml-train-hang -n training-lab
+  POD=$(kubectl get pod -l training.example.com/scenario=ml-train-hang -n training-lab -o jsonpath='{.items[0].metadata.name}')
+  kubectl exec -n training-lab $POD -- ps -o pid,stat,pcpu,etime,cmd -C python3
+  根因: dataloader 死锁、存储/NAS 卡住、NCCL 等通信超时、代码死循环。
+  注意: 日志时间戳不再前进但 Pod 仍 Running，不要直接删，先保存现场。
+EOF
+}
+
+scenario_train_ckpt_corrupt() {
+  ensure_code || return 1
+  k apply -f - >/dev/null <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ml-train-ckpt
+  namespace: $NS
+  labels: {training.example.com/scenario: ml-train-ckpt}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: ml-train-ckpt, training.example.com/scenario: ml-train-ckpt}
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: seed-checkpoint
+          image: $IMG
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - "mkdir -p /ckpt && printf '{\"step\": 100, \"weights\": [0.1, 0.2' > /ckpt/model.json && echo wrote-truncated-checkpoint"
+          volumeMounts:
+            - {name: ckpt, mountPath: /ckpt}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+      containers:
+        - name: trainer
+          image: $IMG
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/opt/ml/train.py"]
+          env:
+            - {name: TRAIN_MODE, value: "ckpt"}
+            - {name: CKPT_PATH, value: "/ckpt/model.json"}
+          volumeMounts:
+            - {name: code, mountPath: /opt/ml}
+            - {name: ckpt, mountPath: /ckpt}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+      volumes:
+        - name: code
+          configMap: {name: ml-code, defaultMode: 0555}
+        - name: ckpt
+          emptyDir: {}
+EOF
+  echo "已注入: /ckpt/model.json 被截断（JSON 不完整），训练恢复时解析失败。"
+  sleep 8
+  show_scenario ml-train-ckpt
+  echo "训练日志:"
+  k logs -n "$NS" -l training.example.com/scenario=ml-train-ckpt --tail=20 2>/dev/null || true
+  echo "init 日志:"
+  k logs -n "$NS" -l training.example.com/scenario=ml-train-ckpt -c seed-checkpoint --tail=10 2>/dev/null || true
+  cat <<'EOF'
+排查路径:
+  kubectl logs -l training.example.com/scenario=ml-train-ckpt -n training-lab --tail=30
+  POD=$(kubectl get pod -l training.example.com/scenario=ml-train-ckpt -n training-lab -o jsonpath='{.items[0].metadata.name}')
+  kubectl exec -n training-lab $POD -- sh -c 'wc -c /ckpt/model.json; head -c 200 /ckpt/model.json'
+  根因: 训练中断时直接写 checkpoint、磁盘满、上传不完整、版本不兼容。
+  正确做法: 临时文件写完 + fsync + 原子 rename，并保留 sha256/版本号。
+EOF
+}
+
+scenario_train_disk_full() {
+  ensure_code || return 1
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-train-disk
+  namespace: $NS
+  labels: {training.example.com/scenario: ml-train-disk}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: trainer
+      image: $IMG
+      imagePullPolicy: IfNotPresent
+      command: ["python3", "/opt/ml/train.py"]
+      env:
+        - {name: TRAIN_MODE, value: "disk"}
+      volumeMounts:
+        - {name: code, mountPath: /opt/ml}
+        - {name: ckpt, mountPath: /ckpt}
+      resources:
+        requests: {cpu: 50m, memory: 64Mi}
+        limits: {cpu: 500m, memory: 256Mi}
+  volumes:
+    - name: code
+      configMap: {name: ml-code, defaultMode: 0555}
+    - name: ckpt
+      emptyDir: {medium: Memory, sizeLimit: 64Mi}
+EOF
+  echo "已注入: checkpoint 目录是 64Mi 的 tmpfs，训练每 0.1s 写 8MB，预期写满后报 No space left on device。"
+  sleep 10
+  show_scenario ml-train-disk
+  echo "训练日志（最后几行）:"
+  k logs ml-train-disk -n "$NS" --tail=12 2>/dev/null || true
+  echo "容器退出状态:"
+  k get pod ml-train-disk -n "$NS" \
+    -o jsonpath='{range .status.containerStatuses[*]}reason={.state.terminated.reason} exit={.state.terminated.exitCode}{"\n"}{end}' 2>/dev/null || true
+  cat <<'EOF'
+排查路径:
+  kubectl get pod ml-train-disk -n training-lab
+  kubectl logs ml-train-disk -n training-lab --tail=30
+  kubectl describe pod ml-train-disk -n training-lab | tail -25
+  典型报错: OSError: [Errno 28] No space left on device
+  根因: checkpoint 保留策略未清理、日志/临时文件写本地盘、未挂载足够容量的 PVC。
+EOF
+}
+
+scenario_train_download_fail() {
+  ensure_code || return 1
+  k apply -f - >/dev/null <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ml-train-download
+  namespace: $NS
+  labels: {training.example.com/scenario: ml-train-download}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: ml-train-download, training.example.com/scenario: ml-train-download}
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: download-model
+          image: $IMG
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -c
+            - |
+              import urllib.request
+              url = "https://models.training.local/bert-base.tar.gz"
+              print("downloading", url, flush=True)
+              urllib.request.urlretrieve(url, "/data/model.tar.gz")
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+      containers:
+        - name: trainer
+          image: $IMG
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/opt/ml/train.py"]
+          env:
+            - {name: TRAIN_MODE, value: "normal"}
+            - {name: DATA_PATH, value: "/data/train.json"}
+          volumeMounts:
+            - {name: code, mountPath: /opt/ml}
+            - {name: data, mountPath: /data}
+            - {name: ckpt, mountPath: /ckpt}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+      volumes:
+        - name: code
+          configMap: {name: ml-code, defaultMode: 0555}
+        - name: data
+          emptyDir: {}
+        - name: ckpt
+          emptyDir: {}
+EOF
+  echo "已注入: init 容器从 models.training.local 下载模型权重，域名不存在。"
+  sleep 8
+  show_scenario ml-train-download
+  echo "下载容器日志:"
+  k logs -n "$NS" -l training.example.com/scenario=ml-train-download -c download-model --tail=20 2>/dev/null || true
+  cat <<'EOF'
+排查路径:
+  kubectl logs -l training.example.com/scenario=ml-train-download -n training-lab -c download-model
+  kubectl describe pod -l training.example.com/scenario=ml-train-download -n training-lab | tail -25
+  根因: 域名/DNS、对象存储 endpoint、VPC 内网端点、代理、网络策略、临时凭证过期。
+  典型报错: socket.gaierror: [Errno -2] Name or service not known / 403 Forbidden。
+EOF
+}
+
+scenario_gpu_unschedulable() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-gpu-pending
+  namespace: $NS
+  labels: {training.example.com/scenario: ml-gpu-pending}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: trainer
+      image: $IMG
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "3600"]
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {cpu: 100m, memory: 32Mi, nvidia.com/gpu: 1}
+EOF
+  echo "已注入: Pod 申请 nvidia.com/gpu=1，当前 ECS 节点无 GPU，预期 Pending。"
+  sleep 5
+  show_scenario ml-gpu-pending
+  echo "调度事件:"
+  k describe pod ml-gpu-pending -n "$NS" 2>/dev/null | grep -A6 'Events:' | tail -8 || true
+  cat <<'EOF'
+排查路径:
+  kubectl describe pod ml-gpu-pending -n training-lab | tail -20
+  kubectl get nodes -o custom-columns='NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu,TAINTS:.spec.taints'
+  kubectl get ds -n kube-system | grep -iE 'nvidia|gpu|device'
+  根因: 节点池没有 GPU 机型、GPU 设备插件未就绪、虚拟节点有污点需 toleration、
+        requests/limits 写法不一致、GPU 型号/显存标签不匹配。
+EOF
+}
+
+scenario_infer_readiness() {
+  ensure_code || return 1
+  apply_infer ml-infer-readiness "" '            - {name: MODEL_PATH, value: /models/model.json}' 256Mi
+  echo "已注入: 推理服务启动但模型文件不存在，/healthz 返回 503，readiness 失败。"
+  sleep 12
+  show_scenario ml-infer-readiness
+  local pod; pod="$(pod_of ml-infer-readiness)"
+  if [ -n "$pod" ]; then
+    echo "容器内健康检查:"
+    k exec -i -n "$NS" "$pod" -- python3 - <<'PY' 2>&1 | tail -3 || true
+import urllib.request
+try:
+    print(urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=2).read().decode())
+except Exception as e:
+    print(type(e).__name__, e)
+PY
+  fi
+  echo "Endpoints:"
+  k get endpoints ml-infer-readiness -n "$NS" 2>/dev/null || true
+  cat <<'EOF'
+排查路径:
+  kubectl get pod -l training.example.com/scenario=ml-infer-readiness -n training-lab
+  kubectl describe pod -l training.example.com/scenario=ml-infer-readiness -n training-lab | grep -A6 -i readiness
+  POD=$(kubectl get pod -l training.example.com/scenario=ml-infer-readiness -n training-lab -o jsonpath='{.items[0].metadata.name}')
+  kubectl exec -n training-lab $POD -- python3 -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8080/healthz').read())"
+  kubectl get endpoints ml-infer-readiness -n training-lab
+  根因: 模型未挂载/路径不对、模型加载失败、依赖服务不可用、启动探针时间太短。
+EOF
+}
+
+scenario_infer_model_missing() {
+  ensure_code || return 1
+  apply_infer ml-infer-missing "" '            - {name: MODEL_PATH, value: /models/model.json}
+            - {name: STRICT_MODEL, value: "1"}' 256Mi
+  echo "已注入: 推理进程强依赖模型文件，文件不存在时启动即退出。"
+  sleep 12
+  show_scenario ml-infer-missing
+  echo "容器日志:"
+  k logs -n "$NS" -l training.example.com/scenario=ml-infer-missing --tail=20 2>/dev/null || true
+  cat <<'EOF'
+排查路径:
+  kubectl get pod -l training.example.com/scenario=ml-infer-missing -n training-lab
+  kubectl logs -l training.example.com/scenario=ml-infer-missing -n training-lab --previous --tail=30
+  kubectl describe pod -l training.example.com/scenario=ml-infer-missing -n training-lab | grep -A8 'Last State'
+  根因: 模型制品未打包进镜像、PVC/对象存储未挂载、initContainer 下载失败、路径拼写错误。
+EOF
+}
+
+scenario_infer_oom() {
+  ensure_code || return 1
+  apply_infer ml-infer-oom "" '            - {name: MODEL_PATH, value: /models/model.json}
+            - {name: MODEL_MEMORY_MB, value: "256"}' 64Mi
+  echo "已注入: 推理加载模型权重需要 256MB，容器 limit=64Mi，预期 OOMKilled。"
+  sleep 12
+  show_scenario ml-infer-oom
+  echo "OOM 证据:"
+  k describe pod -n "$NS" -l training.example.com/scenario=ml-infer-oom 2>/dev/null \
+    | grep -A6 'Last State' | head -10 || true
+  cat <<'EOF'
+排查路径:
+  kubectl get pod -l training.example.com/scenario=ml-infer-oom -n training-lab
+  kubectl describe pod -l training.example.com/scenario=ml-infer-oom -n training-lab | grep -A8 'Last State'
+  kubectl logs -l training.example.com/scenario=ml-infer-oom -n training-lab --previous --tail=20
+  根因: 模型权重/激活值超出 limit、batch 太大、并发太高、未量化/未分片。
+  区分容器 OOM 与节点 OOM: 节点上看 dmesg / messages。
+EOF
+}
+
+scenario_infer_latency() {
+  ensure_code || return 1
+  apply_infer ml-infer-latency ml-model-good '            - {name: MODEL_PATH, value: /models/model.json}
+            - {name: PREDICT_DELAY, value: "3"}' 256Mi
+  echo "已注入: 推理 /predict 固定延迟 3s，客户端超时 1s，预期请求超时。"
+  sleep 12
+  show_scenario ml-infer-latency
+  echo "客户端探测（timeout=1s）:"
+  if k get deploy lab-client -n "$NS" >/dev/null 2>&1; then
+    k exec deploy/lab-client -n "$NS" -- python3 -c '
+import time, urllib.request
+url = "http://ml-infer-latency.training-lab.svc.cluster.local/predict"
+start = time.time()
+try:
+    req = urllib.request.Request(url, data=b"{}", method="POST")
+    print("status", urllib.request.urlopen(req, timeout=1).status)
+except Exception as e:
+    print("client_error", type(e).__name__, e)
+print(f"elapsed={time.time()-start:.2f}s")
+' 2>&1 | tail -4
+  else
+    echo "lab-client 不存在，跳过自动探测；可手动 curl。"
+  fi
+  cat <<'EOF'
+排查路径:
+  kubectl logs -l training.example.com/scenario=ml-infer-latency -n training-lab --tail=30
+  kubectl top pod -l training.example.com/scenario=ml-infer-latency -n training-lab
+  kubectl describe pod -l training.example.com/scenario=ml-infer-latency -n training-lab | grep -A5 -i limits
+  根因: 单请求耗时高（batch/模型大）、CPU 被 limit 节流、并发排队、冷启动、下游依赖慢。
+  进阶: 看 container_cpu_cfs_throttled_seconds_total、P99、队列长度，再考虑扩容/HPA。
+EOF
+}
+
+scenario_infer_version() {
+  ensure_code || return 1
+  apply_infer ml-infer-version ml-model-v1 '            - {name: MODEL_PATH, value: /models/model.json}
+            - {name: EXPECTED_FORMAT, value: "2"}' 256Mi
+  echo "已注入: 模型 format_version=1，推理代码只接受 format_version=2。"
+  sleep 12
+  show_scenario ml-infer-version
+  echo "容器日志:"
+  k logs -n "$NS" -l training.example.com/scenario=ml-infer-version --tail=20 2>/dev/null || true
+  cat <<'EOF'
+排查路径:
+  kubectl logs -l training.example.com/scenario=ml-infer-version -n training-lab --previous --tail=30
+  kubectl describe pod -l training.example.com/scenario=ml-infer-version -n training-lab | grep -A8 'Last State'
+  根因: 模型与推理镜像版本不匹配、导出格式变更、特征预处理版本不一致。
+  正确做法: 模型制品带 format_version/commit，推理服务启动时校验并拒绝不兼容版本。
+EOF
+}
+
+scenario_status() {
+  echo "=== ML Pods ==="
+  k get pods -n "$NS" -l training.example.com/scenario -o wide 2>&1 || true
+  echo "=== ML Jobs ==="
+  k get jobs -n "$NS" -l training.example.com/scenario 2>&1 || true
+  echo "=== ML Deployments / Services ==="
+  k get deploy,svc -n "$NS" -l training.example.com/scenario 2>&1 || true
+  echo "=== 最近事件 ==="
+  k get events -n "$NS" --sort-by=.lastTimestamp 2>&1 | tail -15
+}
+
+recover_one() {
+  local s="$1"
+  case "$s" in
+    train-oom)             k delete job ml-train-oom -n "$NS" --ignore-not-found --wait=false ;;
+    train-crash)           k delete job ml-train-crash -n "$NS" --ignore-not-found --wait=false ;;
+    train-hang)            k delete job ml-train-hang -n "$NS" --ignore-not-found --wait=false ;;
+    train-ckpt-corrupt)    k delete job ml-train-ckpt -n "$NS" --ignore-not-found --wait=false ;;
+    train-disk-full)       k delete pod ml-train-disk -n "$NS" --ignore-not-found --wait=false ;;
+    train-download-fail)   k delete job ml-train-download -n "$NS" --ignore-not-found --wait=false ;;
+    gpu-unschedulable)     k delete pod ml-gpu-pending -n "$NS" --ignore-not-found --wait=false ;;
+    infer-readiness)       k delete deploy ml-infer-readiness -n "$NS" --ignore-not-found --wait=false; k delete svc ml-infer-readiness -n "$NS" --ignore-not-found ;;
+    infer-model-missing)   k delete deploy ml-infer-missing -n "$NS" --ignore-not-found --wait=false; k delete svc ml-infer-missing -n "$NS" --ignore-not-found ;;
+    infer-oom)             k delete deploy ml-infer-oom -n "$NS" --ignore-not-found --wait=false; k delete svc ml-infer-oom -n "$NS" --ignore-not-found ;;
+    infer-latency)         k delete deploy ml-infer-latency -n "$NS" --ignore-not-found --wait=false; k delete svc ml-infer-latency -n "$NS" --ignore-not-found ;;
+    infer-version-mismatch) k delete deploy ml-infer-version -n "$NS" --ignore-not-found --wait=false; k delete svc ml-infer-version -n "$NS" --ignore-not-found ;;
+    *) echo "未知场景: $s" >&2; return 1 ;;
+  esac
+  echo "已恢复: $s"
+}
+
+usage() {
+  cat <<EOF
+用法: $0 <command> [scenario]
+
+场景:
+  train-oom             训练内存超限 -> OOMKilled
+  train-crash           训练读取缺失数据集 -> 异常退出
+  train-hang            训练进程卡住 -> Running 但无进度
+  train-ckpt-corrupt    checkpoint 损坏 -> JSON 解析失败
+  train-disk-full       checkpoint 写满 emptyDir -> Pod 驱逐
+  train-download-fail   模型权重下载失败 -> init 容器报错
+  gpu-unschedulable     申请 GPU 但无可用 GPU 节点 -> Pending
+  infer-readiness       模型未加载 -> readiness 失败、Endpoints 为空
+  infer-model-missing   模型文件缺失 -> 启动即退出
+  infer-oom             推理加载模型 OOM -> OOMKilled
+  infer-latency         推理固定延迟 -> 客户端超时
+  infer-version-mismatch 模型格式版本不匹配 -> 启动失败
+
+命令:
+  list                   列出场景
+  status                 查看 ML 资源
+  inject <scenario>      注入
+  recover <scenario|all> 恢复
+EOF
+}
+
+SCENARIOS="train-oom train-crash train-hang train-ckpt-corrupt train-disk-full train-download-fail gpu-unschedulable infer-readiness infer-model-missing infer-oom infer-latency infer-version-mismatch"
+
+cmd="${1:-help}"
+case "$cmd" in
+  list) echo "$SCENARIOS" | tr ' ' '\n' ;;
+  status) scenario_status ;;
+  inject)
+    s="${2:-}"
+    case "$s" in
+      train-oom) scenario_train_oom ;;
+      train-crash) scenario_train_crash ;;
+      train-hang) scenario_train_hang ;;
+      train-ckpt-corrupt) scenario_train_ckpt_corrupt ;;
+      train-disk-full) scenario_train_disk_full ;;
+      train-download-fail) scenario_train_download_fail ;;
+      gpu-unschedulable) scenario_gpu_unschedulable ;;
+      infer-readiness) scenario_infer_readiness ;;
+      infer-model-missing) scenario_infer_model_missing ;;
+      infer-oom) scenario_infer_oom ;;
+      infer-latency) scenario_infer_latency ;;
+      infer-version-mismatch) scenario_infer_version ;;
+      *) echo "未知场景: ${s:-<空>}"; usage; exit 1 ;;
+    esac ;;
+  recover)
+    s="${2:-}"
+    if [ "$s" = "all" ]; then
+      for x in $SCENARIOS; do recover_one "$x" || true; done
+      k delete configmap ml-code ml-model-good ml-model-v1 -n "$NS" --ignore-not-found
+    else
+      recover_one "$s"
+    fi ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

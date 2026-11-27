@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# 通用 Kubernetes 故障演练统一入口：Chaos / 高级 K8s / ML / 节点四层。
+# 不包含任何云厂商 API，可在任意 K8s 集群使用。
+set -uo pipefail
+
+H="${LAB_HOME:-$HOME/k8s-fault-lab}"
+PY="python3"
+
+usage() {
+  cat <<EOF
+用法: faultlab <command> [args]
+
+  list                         按层级列出全部故障场景
+  status                       全局状态（集群 / training-lab / Chaos / ML / 节点）
+  run <scenario> [args...]     执行场景（自动路由）
+  recover <scenario|all>       恢复本地层（k8s/ML/节点）
+  guide <scenario|all>         打印该场景的排查手册（PLAYBOOK.md）
+
+示例:
+  faultlab run net-delay 120
+  faultlab run ingress-backend
+  faultlab run image-not-found
+  faultlab run train-oom
+  faultlab run infer-latency
+  faultlab run node-oom 256 30
+  faultlab run node-hang 60 --confirm
+  faultlab guide node-oom
+
+分层:
+  k8s    Chaos Mesh（training-lab，自动到期）
+  adv    高级 K8s 配置类（Ingress/证书/镜像/调度/配额/探针）
+  ml     机器学习训练/推理（training-lab，CPU 模拟）
+  node   节点级（SSH 直连或跳板机）
+EOF
+}
+
+list_all() {
+  cat <<EOF
+== k8s: Chaos Mesh（training-lab，自动到期）==
+  net-delay [秒]           client->web 网络延迟 200ms
+  cpu-stress [秒]          lab-web CPU 压力
+  pod-kill                 杀一个 lab-web Pod（自愈）
+  pod-failure [秒]         Pod 持续不可用
+  dns-error [秒]           client DNS 解析失败
+  service-selector         Service selector 错误（Endpoints 为空）
+  finalizer                finalizer 卡删除
+
+== adv: 高级 K8s 配置类故障（lab-adv）==
+  ingress-backend          Ingress 后端端口写错 -> 503
+  ingress-class            IngressClass 不存在 -> 创建了但不生效
+  ingress-tls              创建正常 TLS Ingress（对照基线）
+  cert-bad                 替换为域名不匹配证书
+  cert-expired             替换为过期证书
+  cert-missing             删除 TLS Secret
+  registry-unreachable     镜像仓库不可达 -> ImagePullBackOff
+  image-not-found          镜像 Tag 不存在 -> not found
+  image-bad-digest         镜像 digest 写错 -> not found
+  registry-dns             仓库域名解析失败 -> no such host
+  registry-auth            私有仓库未授权 -> 401（需私有仓库）
+  registry-tls             仓库证书校验失败 -> x509 / IP SAN（需 TLS IP）
+  registry-timeout         仓库连接超时 -> connection timed out
+  image-invalid-ref        镜像名格式非法 -> InvalidImageName
+  pullsecret-missing       imagePullSecrets 缺失
+  oom-killed               容器内存超限 -> OOMKilled
+  crashloop                启动即退出 -> CrashLoopBackOff
+  pvc-pending              StorageClass 不存在 -> PVC/Pod Pending
+  quota-exceeded           超出 ResourceQuota
+  unschedulable            nodeSelector 无匹配节点
+  configmap-missing        ConfigMap 不存在
+  service-port             Service targetPort 错误
+  readiness-fail           就绪探针失败 -> Endpoints 为空
+
+== ml: 机器学习故障（training-lab，CPU 模拟）==
+  train-oom               训练内存超限 -> OOMKilled
+  train-crash             训练读取缺失数据集 -> 异常退出
+  train-hang              训练进程卡住 -> Running 但无进度
+  train-ckpt-corrupt      checkpoint 损坏 -> JSON 解析失败
+  train-disk-full         checkpoint 写满 emptyDir -> No space left
+  train-download-fail     模型权重下载失败 -> init 容器报错
+  gpu-unschedulable       申请 GPU 但无可用节点 -> Pending
+  infer-readiness         模型未加载 -> readiness 失败
+  infer-model-missing     模型文件缺失 -> 启动即退出
+  infer-oom               推理加载模型 OOM -> OOMKilled
+  infer-latency           推理固定延迟 -> 客户端超时
+  infer-version-mismatch  模型格式版本不匹配 -> 启动失败
+
+== node: 节点级（SSH 直连或跳板机）==
+  node-cpu [秒]            CPU 高负载（stress）
+  node-mem [MB] [秒]       内存压力（cgroup 限流）
+  node-oom [MB] [秒]       OOM Kill 演示（messages/dmesg 可查）
+  node-disk [GB] [秒]      磁盘填充
+  node-io [秒]             磁盘 IO 压力（高 iowait）
+  node-kubelet-stop [秒]   停止 kubelet -> NotReady（需 --yes）
+  node-hang [秒]           冻结 kubelet/containerd -> 节点 hang（需 --confirm）
+  node-reboot              重启节点（需 --confirm）
+  node-crash               内核 crash/宕机（需 --confirm）
+EOF
+}
+
+status_all() {
+  echo "########## 集群 ##########"
+  kubectl config current-context 2>/dev/null || true
+  kubectl get nodes -o wide 2>/dev/null || true
+  echo
+  echo "########## Chaos / training-lab ##########"
+  "$H/lab" status 2>&1 || true
+  echo
+  echo "########## 高级 K8s 场景 ##########"
+  "$H/lab-adv" status 2>&1 || true
+  echo
+  echo "########## 机器学习场景 ##########"
+  "$H/ml-lab" status 2>&1 || true
+  echo
+  echo "########## 节点 ##########"
+  "$PY" "$H/node_lab.py" status 2>&1 || true
+}
+
+recover_all() {
+  local what="${1:-all}"
+  case "$what" in
+    all)
+      echo "== 恢复 Chaos 实验 =="; "$H/lab" recover all 2>&1 || true
+      echo "== 恢复高级 K8s 场景 =="; "$H/lab-adv" recover all 2>&1 || true
+      echo "== 恢复机器学习场景 =="; "$H/ml-lab" recover all 2>&1 || true
+      echo "== 恢复节点实验 =="; "$PY" "$H/node_lab.py" recover 2>&1 || true
+      ;;
+    node-*)
+      "$PY" "$H/node_lab.py" recover ;;
+    train-*|infer-*|gpu-unschedulable)
+      "$H/ml-lab" recover "$what" ;;
+    *)
+      "$H/lab-adv" recover "$what" 2>/dev/null || "$H/lab" recover "$what" ;;
+  esac
+}
+
+run_scenario() {
+  local s="${1:-}"; shift || true
+  case "$s" in
+    net-delay|cpu-stress|pod-kill|pod-failure|dns-error|service-selector|finalizer)
+      exec "$H/lab" inject "$s" "$@" ;;
+    ingress-backend|ingress-class|ingress-tls|cert-bad|cert-expired|cert-missing|registry-unreachable|image-not-found|image-bad-digest|registry-dns|registry-auth|registry-tls|registry-timeout|image-invalid-ref|pullsecret-missing|oom-killed|crashloop|pvc-pending|quota-exceeded|unschedulable|configmap-missing|service-port|readiness-fail)
+      exec "$H/lab-adv" inject "$s" "$@" ;;
+    train-*|infer-*|gpu-unschedulable)
+      exec "$H/ml-lab" inject "$s" "$@" ;;
+    node-cpu|node-mem|node-oom|node-disk|node-io|node-kubelet-stop|node-hang|node-reboot|node-crash)
+      exec "$PY" "$H/node_lab.py" "${s#node-}" "$@" ;;
+    ""|help|-h|--help)
+      usage ;;
+    *)
+      echo "未知场景: $s" >&2
+      echo "运行 faultlab list 查看全部场景。" >&2
+      exit 1 ;;
+  esac
+}
+
+guide() {
+  local s="${1:-all}"
+  if [ "$s" = "all" ] || [ ! -f "$H/PLAYBOOK.md" ]; then
+    [ -f "$H/PLAYBOOK.md" ] && exec cat "$H/PLAYBOOK.md"
+    echo "PLAYBOOK.md 不存在" >&2; exit 1
+  fi
+  awk -v pat="^## ${s}\$" '
+    $0 ~ pat {show=1; next}
+    show && /^## / {exit}
+    show {print}
+  ' "$H/PLAYBOOK.md" | sed '/^$/N;/^\n$/D'
+  if ! awk -v pat="^## ${s}\$" '$0 ~ pat {found=1} END {exit !found}' "$H/PLAYBOOK.md"; then
+    echo "手册中没有场景 $s，运行 faultlab guide all 查看全部。" >&2
+    exit 1
+  fi
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  list)    list_all ;;
+  status)  status_all ;;
+  run|inject) run_scenario "$@" ;;
+  recover) recover_all "$@" ;;
+  guide)   guide "$@" ;;
+  help|-h|--help) usage ;;
+  *) echo "未知命令: $cmd" >&2; usage; exit 1 ;;
+esac

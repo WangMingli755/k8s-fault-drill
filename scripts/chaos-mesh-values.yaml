@@ -1,0 +1,72 @@
+# Chaos Mesh 2.8.8 通用 values
+# - clusterScoped + 命名空间注解过滤：只有带 chaos-mesh.org/inject: enabled 的命名空间可注入
+# - 不绑定任何节点标签，Chaos Daemon 由调度器分配到可用节点
+# - 镜像默认 ghcr.io；如集群无法访问 ghcr.io，请替换为可达镜像仓库
+clusterScoped: true
+timezone: "Asia/Shanghai"
+
+images:
+  registry: "ghcr.io"
+  tag: "v2.8.8"
+
+controllerManager:
+  replicaCount: 2
+  enableFilterNamespace: true
+  allowHostNetworkTesting: true
+  podChaos:
+    podFailure:
+      # PodFailure 使用的 pause 镜像；可按集群网络替换
+      pauseImage: "registry.k8s.io/pause:3.9"
+  resources:
+    requests:
+      cpu: 1m
+      memory: 16Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/component
+                  operator: In
+                  values: ["controller-manager"]
+            topologyKey: kubernetes.io/hostname
+
+chaosDaemon:
+  # 默认 containerd；Docker 运行时改为 docker，并设置 socketPath
+  runtime: containerd
+  socketPath: /run/containerd/containerd.sock
+  privileged: true
+  resources:
+    requests:
+      cpu: 1m
+      memory: 16Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+dashboard:
+  create: true
+  service:
+    type: ClusterIP
+  resources:
+    requests:
+      cpu: 1m
+      memory: 16Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
+
+dnsServer:
+  create: true
+  resources:
+    requests:
+      cpu: 1m
+      memory: 16Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi

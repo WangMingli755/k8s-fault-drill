@@ -1,0 +1,749 @@
+#!/usr/bin/env bash
+# 高级故障场景：Ingress / 证书 / 镜像仓库 / 调度 / 存储 / 配额 / 探针。
+# 只操作 training-lab，不触碰其他命名空间。适用于任意 K8s 集群。
+set -uo pipefail
+
+LAB_HOME="$(cd "$(dirname "$0")" && pwd)"
+NS="${LAB_NS:-training-lab}"
+IMG="${LAB_IMAGE:-python:3.10-slim}"
+REGISTRY="${LAB_REGISTRY:-docker.io}"
+INGRESS_NS="${INGRESS_NS:-ingress-nginx}"
+INGRESS_SVC="${INGRESS_SVC:-ingress-nginx-controller}"
+CERT_DIR="$LAB_HOME/certs"
+KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
+KC=()
+[ -n "${ADMIN_KUBECONFIG:-}" ] && KC+=(--kubeconfig "$ADMIN_KUBECONFIG")
+[ -n "${ADMIN_CONTEXT:-}" ] && KC+=(--context "$ADMIN_CONTEXT")
+k() { "$KUBECTL_BIN" "${KC[@]}" "$@"; }
+
+PF_PID=""
+pf_start() {
+  local port="$1" target="$2"
+  k port-forward -n "$INGRESS_NS" svc/"$INGRESS_SVC" "${port}:${target}" \
+    >"/tmp/lab-adv-pf-${port}.log" 2>&1 &
+  PF_PID=$!
+  for _ in $(seq 1 30); do
+    if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then exec 3>&-; return 0; fi
+    sleep 0.2
+  done
+  return 1
+}
+pf_stop() {
+  [ -n "$PF_PID" ] && kill "$PF_PID" 2>/dev/null || true
+  wait "$PF_PID" 2>/dev/null || true
+  PF_PID=""
+}
+
+need_certs() {
+  [ -f "$CERT_DIR/server.crt" ] || python3 "$CERT_DIR/gen_certs.py" >/dev/null
+}
+
+apply_tls_secret() {
+  local cert="$1" key="$2"
+  k create secret tls lab-tls -n "$NS" --cert="$CERT_DIR/$cert" --key="$CERT_DIR/$key" \
+    --dry-run=client -o yaml | k apply -f - >/dev/null
+}
+
+ensure_tls_ingress() {
+  need_certs
+  apply_tls_secret server.crt server.key
+  k apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lab-tls
+  namespace: $NS
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [lab-tls.training.local]
+      secretName: lab-tls
+  rules:
+    - host: lab-tls.training.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: lab-web
+                port:
+                  number: 80
+EOF
+  sleep 5
+}
+
+curl_bad() {
+  pf_start 18080 80 || { echo "port-forward 失败"; return 1; }
+  curl -s -o /dev/null -w '%{http_code}' -H 'Host: lab-bad.training.local' http://127.0.0.1:18080/ 2>/dev/null || true
+  pf_stop
+}
+
+tls_probe() {
+  pf_start 18443 443 || { echo "port-forward 失败"; return 1; }
+  echo | timeout 8 openssl s_client -connect 127.0.0.1:18443 -servername lab-tls.training.local 2>/dev/null \
+    | openssl x509 -noout -subject -dates 2>/dev/null || echo "（TLS 握手失败）"
+  pf_stop
+}
+
+scenario_ingress_backend() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lab-ingress-bad
+  namespace: $NS
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: lab-bad.training.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: lab-web
+                port:
+                  number: 9999
+EOF
+  sleep 5
+  echo "已注入: Ingress 后端端口写错（9999），预期 503。"
+  echo "当前 HTTP 状态: $(curl_bad)"
+  cat <<EOF
+排查路径:
+  kubectl describe ingress lab-ingress-bad -n $NS
+  kubectl get svc lab-web -n $NS -o yaml
+  kubectl logs -n $INGRESS_NS -l app.kubernetes.io/component=controller --tail=50 | grep lab-ingress-bad
+  kubectl port-forward -n $INGRESS_NS svc/$INGRESS_SVC 18080:80 &
+  curl -v -H 'Host: lab-bad.training.local' http://127.0.0.1:18080/
+EOF
+}
+
+scenario_ingress_class() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lab-ingress-class
+  namespace: $NS
+spec:
+  ingressClassName: nginx-missing
+  rules:
+    - host: lab-class.training.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: lab-web
+                port:
+                  number: 80
+EOF
+  sleep 3
+  echo "已创建 Ingress lab-ingress-class，ingressClassName=nginx-missing（没有控制器处理）。"
+  echo "预期: ADDRESS 为空，访问 404；Pod/Service 本身正常。"
+  k get ingress lab-ingress-class -n "$NS" 2>/dev/null || true
+  cat <<EOF
+排查路径:
+  kubectl get ingressclass
+  kubectl get ingress lab-ingress-class -n $NS -o yaml | grep -A2 ingressClassName
+  kubectl describe ingress lab-ingress-class -n $NS
+  kubectl port-forward -n $INGRESS_NS svc/$INGRESS_SVC 18080:80 &
+  curl -v -H 'Host: lab-class.training.local' http://127.0.0.1:18080/
+EOF
+}
+
+scenario_ingress_tls() {
+  ensure_tls_ingress
+  echo "已创建正常 TLS Ingress: https://lab-tls.training.local"
+  echo "证书信息:"; tls_probe
+  pf_start 18443 443 || { echo "port-forward 失败"; return 1; }
+  echo "HTTP 状态(忽略证书校验): $(curl -sk -o /dev/null -w '%{http_code}' --resolve lab-tls.training.local:18443:127.0.0.1 https://lab-tls.training.local:18443/)"
+  echo -n "证书校验(使用演练 CA): "
+  curl -s --cacert "$CERT_DIR/ca.crt" -o /dev/null -w 'code=%{http_code}\n' \
+    --resolve lab-tls.training.local:18443:127.0.0.1 https://lab-tls.training.local:18443/ 2>&1 || true
+  pf_stop
+}
+
+scenario_cert_bad() {
+  ensure_tls_ingress
+  apply_tls_secret wrong.crt wrong.key
+  sleep 6
+  echo "已替换证书: 域名不匹配（CN=wrong.example.com）。"
+  echo "注意: ingress-nginx 会校验证书域名，拒绝加载并回退到 Fake Certificate。"
+  echo "控制器日志:"
+  kubectl logs -n kube-system -l app.kubernetes.io/component=controller --tail=80 2>&1 \
+    | grep -i 'lab-tls' | tail -3
+  echo "证书信息:"; tls_probe
+  echo "curl 校验结果（使用演练 CA，应报域名不匹配）:"
+  pf_start 18443 443 || { echo "port-forward 失败"; return 1; }
+  curl -sS --cacert "$CERT_DIR/ca.crt" -o /dev/null \
+    --resolve lab-tls.training.local:18443:127.0.0.1 https://lab-tls.training.local:18443/ 2>&1 | head -3 || true
+  pf_stop
+  echo "排查: kubectl get secret lab-tls -n $NS -o jsonpath='{.data.tls\\.crt}' | base64 -d | openssl x509 -noout -subject -dates"
+}
+
+scenario_cert_expired() {
+  ensure_tls_ingress
+  apply_tls_secret expired.crt expired.key
+  sleep 6
+  echo "已替换证书: 已过期（notAfter 在昨天）。"
+  echo "证书信息:"; tls_probe
+  echo "curl 校验结果（使用演练 CA，应报证书过期）:"
+  pf_start 18443 443 || { echo "port-forward 失败"; return 1; }
+  curl -sS --cacert "$CERT_DIR/ca.crt" -o /dev/null \
+    --resolve lab-tls.training.local:18443:127.0.0.1 https://lab-tls.training.local:18443/ 2>&1 | head -3 || true
+  pf_stop
+  echo "排查: kubectl describe ingress lab-tls -n $NS; kubectl get secret lab-tls -n $NS"
+}
+
+scenario_cert_missing() {
+  ensure_tls_ingress
+  k delete secret lab-tls -n "$NS" --ignore-not-found
+  sleep 6
+  echo "已删除 TLS Secret lab-tls，Ingress 引用了不存在的证书。"
+  echo "证书信息（应变成 ingress-nginx 默认假证书）:"; tls_probe
+  cat <<EOF
+排查路径:
+  kubectl describe ingress lab-tls -n $NS
+  kubectl get secret -n $NS
+  kubectl logs -n kube-system -l app.kubernetes.io/component=controller --tail=50 | grep -i 'lab-tls\|secret'
+EOF
+}
+
+scenario_registry_unreachable() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-registry
+  namespace: $NS
+  labels: {training.example.com/scenario: registry}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: 127.0.0.1:5000/training/app:1.0
+      imagePullPolicy: Always
+      resources:
+        requests: {cpu: 1m, memory: 8Mi}
+EOF
+  echo "已注入: 引用不可达镜像仓库 127.0.0.1:5000，预期 ImagePullBackOff。"
+  sleep 5
+  k get pod smoke-registry -n "$NS" 2>/dev/null || true
+  cat <<EOF
+排查路径:
+  kubectl describe pod smoke-registry -n $NS | tail -20
+  节点上: curl -v http://127.0.0.1:5000/v2/ ；crictl images | grep training
+  典型事件: failed to resolve reference / connection refused
+EOF
+}
+
+scenario_pullsecret_missing() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-pullsecret
+  namespace: $NS
+  labels: {training.example.com/scenario: pullsecret}
+spec:
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: missing-regcred
+  containers:
+    - name: app
+      image: 127.0.0.1:5000/training/app:1.0
+      imagePullPolicy: Always
+      resources:
+        requests: {cpu: 1m, memory: 8Mi}
+EOF
+  echo "已注入: imagePullSecrets 引用不存在的 missing-regcred。"
+  sleep 5
+  k get pod smoke-pullsecret -n "$NS" 2>/dev/null || true
+  cat <<EOF
+排查路径:
+  kubectl describe pod smoke-pullsecret -n $NS | grep -A3 -i 'pull\|secret'
+  kubectl get secret -n $NS
+  典型事件: FailedToRetrieveImagePullSecret
+EOF
+}
+
+inject_pull_fail() {
+  local pod="$1" image="$2" desc="$3" expect="$4" wait_s="${5:-6}"
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $pod
+  namespace: $NS
+  labels: {training.example.com/scenario: registry}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: "$image"
+      imagePullPolicy: Always
+      resources:
+        requests: {cpu: 1m, memory: 8Mi}
+EOF
+  echo "已注入: $desc"
+  echo "预期事件: $expect"
+  sleep "$wait_s"
+  k get pod "$pod" -n "$NS" 2>/dev/null || true
+  echo "最近拉取事件:"
+  k describe pod "$pod" -n "$NS" 2>/dev/null | grep -A2 'Failed to pull' | tail -4 || true
+  cat <<EOF
+排查路径:
+  kubectl describe pod $pod -n $NS | tail -25
+  kubectl get events -n $NS --sort-by=.lastTimestamp | tail -10
+  节点上: crictl pull $image ; crictl images | head
+  containerd 日志: journalctl -u containerd --since '10 min ago' --no-pager | tail -30
+EOF
+}
+
+scenario_image_not_found() {
+  inject_pull_fail smoke-image-404 "${LAB_BAD_IMAGE:-python:no-such-tag-xyz}" \
+    "镜像 Tag 不存在（仓库可达、匿名可读）" "not found / manifest unknown"
+}
+
+scenario_image_bad_digest() {
+  inject_pull_fail smoke-image-digest \
+    "${LAB_BAD_DIGEST_IMAGE:-python@sha256:0000000000000000000000000000000000000000000000000000000000000000}" \
+    "镜像 digest 写错（64 位全 0，格式合法但不存在）" "not found / manifest unknown"
+}
+
+scenario_registry_dns() {
+  inject_pull_fail smoke-registry-dns "registry.training.local/training/app:1.0" \
+    "镜像仓库域名不存在" "dial tcp: lookup registry.training.local ... no such host"
+}
+
+scenario_registry_auth() {
+  inject_pull_fail smoke-registry-auth "${LAB_PRIVATE_IMAGE:-$REGISTRY/library/private-demo:1.0}" \
+    "拉取未授权的私有仓库路径" "401 Unauthorized / failed to authorize"
+}
+
+scenario_registry_tls() {
+  local ip="${LAB_TLS_IP:-}"
+  if [ -z "$ip" ]; then
+    ip="$(k get svc -n "$INGRESS_NS" "$INGRESS_SVC" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)"
+  fi
+  if [ -z "$ip" ]; then
+    echo "跳过 registry-tls：请设置 LAB_TLS_IP=<一个 HTTPS 入口 IP>（证书不含 IP SAN）。" >&2
+    return 2
+  fi
+  inject_pull_fail smoke-registry-tls "$ip/library/app:1.0" \
+    "镜像仓库地址指向集群入口 IP，TLS 证书不含 IP SAN" "x509: cannot validate certificate ... no IP SANs"
+}
+
+scenario_registry_timeout() {
+  inject_pull_fail smoke-registry-timeout "10.255.255.1/training/app:1.0" \
+    "镜像仓库地址不可路由（黑洞 IP，SYN 无响应）" "dial tcp ... connect: connection timed out" 25
+}
+
+scenario_image_invalid_ref() {
+  inject_pull_fail smoke-image-invalid "training/App:Bad Tag" \
+    "镜像名格式非法（大写仓库名 + 含空格 Tag）" "InvalidImageName / invalid reference format" 4
+}
+
+scenario_oom_killed() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-oom
+  namespace: $NS
+  labels: {training.example.com/scenario: oom}
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: $IMG
+      imagePullPolicy: IfNotPresent
+      command: ["python3", "-c", "import time; a=bytearray(200*1024*1024); time.sleep(3600)"]
+      resources:
+        requests: {cpu: 1m, memory: 8Mi}
+        limits: {cpu: 100m, memory: 32Mi}
+EOF
+  echo "已注入: 容器申请 200MB，limit 32Mi，预期 OOMKilled/CrashLoopBackOff。"
+  sleep 12
+  k get pod smoke-oom -n "$NS" 2>/dev/null || true
+  cat <<EOF
+排查路径:
+  kubectl describe pod smoke-oom -n $NS | grep -A5 'Last State'
+  kubectl get pod smoke-oom -n $NS -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'
+  节点上: dmesg -T | grep -i 'oom\|killed process'；grep -i oom /var/log/messages | tail
+  节点级: python3 $LAB_HOME/node_lab.py logs
+EOF
+}
+
+scenario_crashloop() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-crashloop
+  namespace: $NS
+  labels: {training.example.com/scenario: crashloop}
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: $IMG
+      imagePullPolicy: IfNotPresent
+      command: ["python3", "-c", "import sys; print('boot failed'); sys.exit(1)"]
+      resources:
+        requests: {cpu: 1m, memory: 8Mi}
+EOF
+  echo "已注入: 容器启动即退出，预期 CrashLoopBackOff。"
+  sleep 10
+  k get pod smoke-crashloop -n "$NS" 2>/dev/null || true
+  cat <<EOF
+排查路径:
+  kubectl logs smoke-crashloop -n $NS
+  kubectl logs smoke-crashloop -n $NS --previous
+  kubectl describe pod smoke-crashloop -n $NS | tail -20
+EOF
+}
+
+scenario_pvc_pending() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: smoke-pvc
+  namespace: $NS
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: no-such-sc
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-pvc-pod
+  namespace: $NS
+  labels: {training.example.com/scenario: pvc}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: $IMG
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "3600"]
+      resources:
+        requests: {cpu: 1m, memory: 8Mi}
+      volumeMounts:
+        - {name: data, mountPath: /data}
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: smoke-pvc
+EOF
+  echo "已注入: PVC 使用不存在的 StorageClass，预期 PVC/Pod 均 Pending。"
+  k get pvc smoke-pvc -n "$NS" 2>/dev/null || true
+  k get pod smoke-pvc-pod -n "$NS" 2>/dev/null || true
+  cat <<EOF
+排查路径:
+  kubectl describe pvc smoke-pvc -n $NS
+  kubectl get storageclass
+  kubectl describe pod smoke-pvc-pod -n $NS | tail -15
+EOF
+}
+
+scenario_quota_exceeded() {
+  echo "已注入: 申请 100 CPU / 128Gi 内存，预期被 ResourceQuota 拒绝。"
+  k apply -f - <<EOF 2>&1 || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-quota
+  namespace: $NS
+  labels: {training.example.com/scenario: quota}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: $IMG
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "3600"]
+      resources:
+        requests: {cpu: "100", memory: "128Gi"}
+        limits: {cpu: "100", memory: "128Gi"}
+EOF
+  cat <<EOF
+排查路径:
+  kubectl describe resourcequota -n $NS
+  kubectl get events -n $NS --sort-by=.lastTimestamp | tail
+  典型错误: exceeded quota
+EOF
+}
+
+scenario_unschedulable() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-unschedulable
+  namespace: $NS
+  labels: {training.example.com/scenario: unschedulable}
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    training.example.com/no-such-node: "true"
+  containers:
+    - name: app
+      image: $IMG
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "3600"]
+      resources:
+        requests: {cpu: 1m, memory: 8Mi}
+EOF
+  echo "已注入: nodeSelector 指向不存在的标签，预期 Pending。"
+  k get pod smoke-unschedulable -n "$NS" 2>/dev/null || true
+  cat <<EOF
+排查路径:
+  kubectl describe pod smoke-unschedulable -n $NS | tail -15
+  kubectl get nodes --show-labels | grep training
+  典型事件: 0/8 nodes are available
+EOF
+}
+
+scenario_configmap_missing() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-configmap
+  namespace: $NS
+  labels: {training.example.com/scenario: configmap}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: $IMG
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "3600"]
+      resources:
+        requests: {cpu: 1m, memory: 8Mi}
+      volumeMounts:
+        - {name: cfg, mountPath: /cfg}
+  volumes:
+    - name: cfg
+      configMap:
+        name: missing-cm
+EOF
+  echo "已注入: 挂载不存在的 ConfigMap，预期 ContainerCreating。"
+  sleep 4
+  k get pod smoke-configmap -n "$NS" 2>/dev/null || true
+  cat <<EOF
+排查路径:
+  kubectl describe pod smoke-configmap -n $NS | tail -15
+  kubectl get configmap -n $NS
+  典型事件: configmap "missing-cm" not found
+EOF
+}
+
+scenario_service_port() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab-web-badport
+  namespace: $NS
+spec:
+  selector: {app: lab-web}
+  ports:
+    - port: 80
+      targetPort: 9999
+EOF
+  echo "已注入: Service targetPort 指向 9999（容器监听 8080），预期连接拒绝。"
+  k get endpoints lab-web-badport -n "$NS" 2>/dev/null || true
+  echo -n "从 lab-client 访问结果: "
+  k exec deploy/lab-client -n "$NS" -- python3 -c \
+    "import urllib.request;print(urllib.request.urlopen('http://lab-web-badport.$NS.svc.cluster.local/',timeout=3).status)" 2>&1 | tail -1
+  cat <<EOF
+排查路径:
+  kubectl get svc lab-web-badport -n $NS -o yaml
+  kubectl get endpoints lab-web-badport -n $NS
+  kubectl exec deploy/lab-client -n $NS -- python3 -c "import urllib.request;print(urllib.request.urlopen('http://lab-web-badport/').status)"
+EOF
+}
+
+scenario_readiness_fail() {
+  k apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smoke-readiness
+  namespace: $NS
+  labels: {app: smoke-readiness}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: smoke-readiness}
+  template:
+    metadata:
+      labels: {app: smoke-readiness}
+    spec:
+          containers:
+        - name: app
+          image: $IMG
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-m", "http.server", "8080"]
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 1m, memory: 8Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smoke-readiness
+  namespace: $NS
+spec:
+  selector: {app: smoke-readiness}
+  ports:
+    - port: 80
+      targetPort: 8080
+EOF
+  echo "已注入: readinessProbe 访问不存在的 /healthz，预期 Pod Running 0/1、Endpoints 为空。"
+  sleep 14
+  k get pod -l app=smoke-readiness -n "$NS" 2>/dev/null || true
+  k get endpoints smoke-readiness -n "$NS" 2>/dev/null || true
+  cat <<EOF
+排查路径:
+  kubectl describe pod -l app=smoke-readiness -n $NS | grep -A5 -i readiness
+  kubectl get endpoints smoke-readiness -n $NS
+  kubectl logs deploy/smoke-readiness -n $NS
+EOF
+}
+
+recover_one() {
+  local s="$1"
+  case "$s" in
+    ingress-backend) k delete ingress lab-ingress-bad -n "$NS" --ignore-not-found ;;
+    ingress-class)   k delete ingress lab-ingress-class -n "$NS" --ignore-not-found ;;
+    ingress-tls)     k delete ingress lab-tls -n "$NS" --ignore-not-found; k delete secret lab-tls -n "$NS" --ignore-not-found ;;
+    cert-bad|cert-expired|cert-missing)
+      k delete ingress lab-tls -n "$NS" --ignore-not-found
+      k delete secret lab-tls -n "$NS" --ignore-not-found ;;
+    registry-unreachable) k delete pod smoke-registry -n "$NS" --ignore-not-found --wait=false ;;
+    image-not-found)      k delete pod smoke-image-404 -n "$NS" --ignore-not-found --wait=false ;;
+    image-bad-digest)     k delete pod smoke-image-digest -n "$NS" --ignore-not-found --wait=false ;;
+    registry-dns)         k delete pod smoke-registry-dns -n "$NS" --ignore-not-found --wait=false ;;
+    registry-auth)        k delete pod smoke-registry-auth -n "$NS" --ignore-not-found --wait=false ;;
+    registry-tls)         k delete pod smoke-registry-tls -n "$NS" --ignore-not-found --wait=false ;;
+    registry-timeout)     k delete pod smoke-registry-timeout -n "$NS" --ignore-not-found --wait=false ;;
+    image-invalid-ref)    k delete pod smoke-image-invalid -n "$NS" --ignore-not-found --wait=false ;;
+    pullsecret-missing)   k delete pod smoke-pullsecret -n "$NS" --ignore-not-found --wait=false ;;
+    oom-killed)           k delete pod smoke-oom -n "$NS" --ignore-not-found --wait=false ;;
+    crashloop)            k delete pod smoke-crashloop -n "$NS" --ignore-not-found --wait=false ;;
+    pvc-pending)          k delete pod smoke-pvc-pod -n "$NS" --ignore-not-found --wait=false; k delete pvc smoke-pvc -n "$NS" --ignore-not-found ;;
+    quota-exceeded)       k delete pod smoke-quota -n "$NS" --ignore-not-found ;;
+    unschedulable)        k delete pod smoke-unschedulable -n "$NS" --ignore-not-found --wait=false ;;
+    configmap-missing)    k delete pod smoke-configmap -n "$NS" --ignore-not-found --wait=false ;;
+    service-port)         k delete svc lab-web-badport -n "$NS" --ignore-not-found ;;
+    readiness-fail)       k delete deploy smoke-readiness -n "$NS" --ignore-not-found; k delete svc smoke-readiness -n "$NS" --ignore-not-found ;;
+    *) echo "未知场景: $s" >&2; return 1 ;;
+  esac
+  echo "已恢复: $s"
+}
+
+scenario_status() {
+  echo "=== Pods ==="; k get pods -n "$NS" -o wide 2>&1
+  echo "=== Ingress ==="; k get ingress -n "$NS" 2>&1
+  echo "=== PVC ==="; k get pvc -n "$NS" 2>&1
+  echo "=== Quota ==="; k get resourcequota -n "$NS" 2>&1
+  echo "=== 最近事件 ==="; k get events -n "$NS" --sort-by=.lastTimestamp 2>&1 | tail -15
+}
+
+usage() {
+  cat <<EOF
+用法: $0 <command> [scenario]
+
+场景:
+  ingress-backend      Ingress 后端端口写错（503）
+  ingress-class        IngressClass 不存在（创建了但不生效）
+  ingress-tls          创建正常 TLS Ingress（前置）
+  cert-bad             替换为域名不匹配证书
+  cert-expired         替换为过期证书
+  cert-missing         删除 TLS Secret
+  registry-unreachable 镜像仓库不可达（ImagePullBackOff）
+  image-not-found      镜像 Tag 不存在（manifest not found）
+  image-bad-digest     镜像 digest 写错（not found）
+  registry-dns         仓库域名解析失败（no such host）
+  registry-auth        私有仓库未授权（401）
+  registry-tls         仓库证书校验失败（x509 / IP SAN）
+  registry-timeout     仓库连接超时（connection timed out）
+  image-invalid-ref    镜像名格式非法（InvalidImageName）
+  pullsecret-missing   imagePullSecrets 缺失
+  oom-killed           容器内存超限 OOMKilled
+  crashloop            启动即退出 CrashLoopBackOff
+  pvc-pending          StorageClass 不存在，PVC/Pod Pending
+  quota-exceeded       超出 ResourceQuota
+  unschedulable        nodeSelector 无匹配节点
+  configmap-missing    ConfigMap 不存在
+  service-port         Service targetPort 错误
+  readiness-fail       就绪探针失败，Endpoints 为空
+
+命令:
+  list                 列出场景
+  status               查看 $NS 资源
+  inject <scenario>    注入
+  recover <scenario|all> 恢复
+  verify <scenario>    仅打印该场景排查路径（注入时会自动打印）
+EOF
+}
+
+SCENARIOS="ingress-backend ingress-class ingress-tls cert-bad cert-expired cert-missing registry-unreachable image-not-found image-bad-digest registry-dns registry-auth registry-tls registry-timeout image-invalid-ref pullsecret-missing oom-killed crashloop pvc-pending quota-exceeded unschedulable configmap-missing service-port readiness-fail"
+
+cmd="${1:-help}"
+case "$cmd" in
+  list) echo "$SCENARIOS" | tr ' ' '\n' ;;
+  status) scenario_status ;;
+  inject)
+    s="${2:-}"
+    case "$s" in
+      ingress-backend) scenario_ingress_backend ;;
+      ingress-class) scenario_ingress_class ;;
+      ingress-tls) scenario_ingress_tls ;;
+      cert-bad) scenario_cert_bad ;;
+      cert-expired) scenario_cert_expired ;;
+      cert-missing) scenario_cert_missing ;;
+      registry-unreachable) scenario_registry_unreachable ;;
+      image-not-found) scenario_image_not_found ;;
+      image-bad-digest) scenario_image_bad_digest ;;
+      registry-dns) scenario_registry_dns ;;
+      registry-auth) scenario_registry_auth ;;
+      registry-tls) scenario_registry_tls ;;
+      registry-timeout) scenario_registry_timeout ;;
+      image-invalid-ref) scenario_image_invalid_ref ;;
+      pullsecret-missing) scenario_pullsecret_missing ;;
+      oom-killed) scenario_oom_killed ;;
+      crashloop) scenario_crashloop ;;
+      pvc-pending) scenario_pvc_pending ;;
+      quota-exceeded) scenario_quota_exceeded ;;
+      unschedulable) scenario_unschedulable ;;
+      configmap-missing) scenario_configmap_missing ;;
+      service-port) scenario_service_port ;;
+      readiness-fail) scenario_readiness_fail ;;
+      *) echo "未知场景: ${s:-<空>}"; usage; exit 1 ;;
+    esac ;;
+  recover)
+    s="${2:-}"
+    if [ "$s" = "all" ]; then
+      for x in $SCENARIOS; do recover_one "$x" || true; done
+    else
+      recover_one "$s"
+    fi ;;
+  verify) echo "注入时会自动打印排查路径；也可参考 README 的场景表。" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

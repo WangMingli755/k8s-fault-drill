@@ -1,0 +1,32 @@
+# 网络延迟：只影响 lab-client -> lab-web，200ms 包级延迟，默认 120 秒。
+# __EXPIRES_AT__ 由 prepare-chaos.py 渲染为 UTC RFC3339，供 guardian 兜底回收。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: smoke-network-delay
+  namespace: training-lab
+  labels:
+    training.example.com/scenario: network-delay
+  annotations:
+    training.example.com/expires-at: "__EXPIRES_AT__"
+spec:
+  action: delay
+  mode: one
+  selector:
+    namespaces:
+      - training-lab
+    labelSelectors:
+      app: lab-client
+  direction: to
+  target:
+    mode: one
+    selector:
+      namespaces:
+        - training-lab
+      labelSelectors:
+        app: lab-web
+  delay:
+    latency: "200ms"
+    jitter: "0ms"
+    correlation: "0"
+  duration: "120s"

@@ -1,0 +1,19 @@
+# Pod failure：把容器替换为 pause 镜像，制造持续不可用，到期自动恢复。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: smoke-pod-failure
+  namespace: training-lab
+  labels:
+    training.example.com/scenario: pod-failure
+  annotations:
+    training.example.com/expires-at: "__EXPIRES_AT__"
+spec:
+  action: pod-failure
+  mode: one
+  selector:
+    namespaces:
+      - training-lab
+    labelSelectors:
+      app: lab-web
+  duration: "60s"

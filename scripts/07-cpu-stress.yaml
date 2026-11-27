@@ -1,0 +1,22 @@
+# CPU 压力：对 lab-web 容器施加 60 秒 CPU 负载，观察容器限流而非压垮节点。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: smoke-cpu-stress
+  namespace: training-lab
+  labels:
+    training.example.com/scenario: cpu-stress
+  annotations:
+    training.example.com/expires-at: "__EXPIRES_AT__"
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - training-lab
+    labelSelectors:
+      app: lab-web
+  stressors:
+    cpu:
+      workers: 2
+      load: 80
+  duration: "60s"

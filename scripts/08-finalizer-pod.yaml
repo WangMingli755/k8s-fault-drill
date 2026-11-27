@@ -1,0 +1,23 @@
+# finalizer 演示：只使用实验专用键 training.example.com/manual-cleanup。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-finalizer
+  namespace: training-lab
+  finalizers:
+    - training.example.com/manual-cleanup
+  labels:
+    training.example.com/scenario: finalizer
+spec:
+  restartPolicy: Never
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.9
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: 1m
+          memory: 8Mi
+        limits:
+          cpu: 50m
+          memory: 32Mi

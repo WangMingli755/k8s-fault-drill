@@ -1,0 +1,21 @@
+# DNS 错误：让 lab-client 解析 lab-web 服务域名失败，验证 DNS 排障路径。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: DNSChaos
+metadata:
+  name: smoke-dns-error
+  namespace: training-lab
+  labels:
+    training.example.com/scenario: dns-error
+  annotations:
+    training.example.com/expires-at: "__EXPIRES_AT__"
+spec:
+  action: error
+  mode: one
+  selector:
+    namespaces:
+      - training-lab
+    labelSelectors:
+      app: lab-client
+  patterns:
+    - "lab-web.training-lab.svc.cluster.local"
+  duration: "60s"
